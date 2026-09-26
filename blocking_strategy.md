@@ -1,7 +1,6 @@
 <h1 align = "center">Similarity Strategy </h1>
 <br>
-<h2>String similarity calculation can help us with any of these problems but generally computationally expensive and don’t automatically produce ideal outcomes due to the diverse and fuzzy nature of all the possible data faults.
-</h2> 
+
 <h2> TECHNIQUES FOR STRING SIMILARITY:</h2>
 source : https://www.baeldung.com/cs/string-similarity-edit-distance <br>
 https://www.baeldung.com/cs/string-similarity-token-methods
