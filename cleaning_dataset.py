@@ -20,6 +20,7 @@ process_file("student_resource/dataset/test/test_source1.tsv", "data/processed/t
 process_file("student_resource/dataset/test/test_source2.tsv", "data/processed/test_source2_clean.tsv")
 process_file("student_resource/dataset/test/test_source3.tsv", "data/processed/test_source3_clean.tsv")
 #%%
+from blocking import run_blocking
 run_blocking(
     clean_dir="data/processed",
     split="test",
@@ -27,6 +28,7 @@ run_blocking(
 )
 #%%
 import os
+import pandas as pd
 size_gb = os.path.getsize("output/candidate_pairs.tsv") / (1024**3)
 print(f"{size_gb:.2f} GB")
 #%%
@@ -46,6 +48,7 @@ run_blocking(clean_dir="data/processed", split="train",
               max_candidates=300)  # or whatever you land on
 
 #%%
+from blocking import run_blocking
 run_blocking(clean_dir="data/processed", split="test",
              output_path="output/candidate_pairs.tsv",
              max_candidates=300)

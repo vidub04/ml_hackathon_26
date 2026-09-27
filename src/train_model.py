@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import pickle
+import random
 import sys
 from pathlib import Path
 
@@ -52,6 +53,7 @@ from io_utils import (  # noqa: E402
     load_clean_source,
     build_clean_lookup,
     load_id_list_tsv,
+    iter_id_list_tsv_chunks,
     explode_id_list,
 )
 
@@ -223,9 +225,23 @@ def main():
     ap.add_argument("--model-out", default="models/matcher.pkl")
     ap.add_argument("--val-fraction", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--chunksize", type=int, default=50_000,
+                     help="rows (Source-1 entities) read from candidate_pairs.tsv per chunk. "
+                          "Lower this if you still hit a MemoryError.")
+    ap.add_argument("--neg-per-pos", type=int, default=20,
+                     help="for an entity with N true matches, keep at most neg_per_pos*max(N,1) "
+                          "of its negative candidates (all positives are always kept). This is "
+                          "what keeps the training set a manageable size on a multi-GB "
+                          "candidate_pairs.tsv without needing to hold the whole file in memory.")
+    ap.add_argument("--min-neg-per-entity", type=int, default=5,
+                     help="floor on negatives kept per entity even when neg_per_pos*positives "
+                          "would be 0 (singletons still need some negative signal)")
+    ap.add_argument("--max-neg-per-entity", type=int, default=200,
+                     help="hard cap on negatives kept per entity regardless of neg_per_pos")
     args = ap.parse_args()
 
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(args.seed)
 
     print("[train] loading sources...")
     s1_df = load_clean_source(args.source1)
@@ -235,7 +251,6 @@ def main():
     s2s3_lookup = {**build_clean_lookup(s2_df), **build_clean_lookup(s3_df)}
 
     gt_df = load_id_list_tsv(args.ground_truth, "source1_entity_id", "matched_entity_ids")
-    cand_df = load_id_list_tsv(args.candidate_pairs, "source1_entity_id", "candidate_entity_ids")
 
     # every source1 entity must be represented, even singletons w/ no candidates
     all_s1_ids = s1_df["entity_id"].tolist()
@@ -245,23 +260,69 @@ def main():
     gt_full["matched_entity_ids"] = gt_full["matched_entity_ids"].fillna("")
 
     gt_pairs = explode_id_list(gt_df, "source1_entity_id", "matched_entity_ids")
-    gt_pairs["label"] = 1
     positive_set = set(zip(gt_pairs["source1_entity_id"], gt_pairs["entity_id"]))
+    pos_count_per_entity = gt_pairs.groupby("source1_entity_id").size().to_dict()
 
-    cand_pairs = explode_id_list(cand_df, "source1_entity_id", "candidate_entity_ids")
+    # ------------------------------------------------------------------
+    # Stream candidate_pairs.tsv in chunks (one row = one Source-1 entity's
+    # full candidate list, so a row is never split across chunk boundaries).
+    # For each entity: keep ALL its positive candidates, and downsample its
+    # negative candidates to a bounded number. This is what avoids ever
+    # holding the full (potentially tens-of-GB) exploded candidate set in
+    # memory at once — peak memory is bounded by chunksize and by the
+    # downsampled pair count, not by the raw file size.
+    # ------------------------------------------------------------------
+    print(f"[train] streaming {args.candidate_pairs} in chunks of {args.chunksize} rows...")
+    s1_ids_out, cand_ids_out, labels_out = [], [], []
+    seen_positive_pairs = set()
+    total_raw_candidates = 0
+    n_entities_seen = 0
+
+    for chunk in iter_id_list_tsv_chunks(
+        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids", chunksize=args.chunksize
+    ):
+        for s1_id, id_list in zip(chunk["source1_entity_id"], chunk["candidate_entity_ids"]):
+            n_entities_seen += 1
+            if not isinstance(id_list, str) or not id_list.strip():
+                continue
+            cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
+            cand_ids = list(dict.fromkeys(cand_ids))  # de-dup, keep order
+            total_raw_candidates += len(cand_ids)
+
+            pos_here = [c for c in cand_ids if (s1_id, c) in positive_set]
+            neg_here = [c for c in cand_ids if (s1_id, c) not in positive_set]
+
+            seen_positive_pairs.update((s1_id, c) for c in pos_here)
+
+            n_pos_gt = pos_count_per_entity.get(s1_id, 0)
+            neg_budget = min(
+                args.max_neg_per_entity,
+                max(args.min_neg_per_entity, args.neg_per_pos * max(n_pos_gt, 1)),
+            )
+            if len(neg_here) > neg_budget:
+                neg_here = rng.sample(neg_here, neg_budget)
+
+            for c in pos_here:
+                s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(1)
+            for c in neg_here:
+                s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(0)
+
+    cand_pairs = pd.DataFrame({
+        "source1_entity_id": s1_ids_out,
+        "entity_id": cand_ids_out,
+        "label": labels_out,
+    })
     cand_pairs = cand_pairs.drop_duplicates(subset=["source1_entity_id", "entity_id"]).reset_index(drop=True)
-    cand_pairs["label"] = cand_pairs.apply(
-        lambda r: 1 if (r["source1_entity_id"], r["entity_id"]) in positive_set else 0, axis=1
-    )
 
-    n_missed = len(positive_set - set(zip(cand_pairs["source1_entity_id"], cand_pairs["entity_id"])))
+    n_missed = len(positive_set - seen_positive_pairs)
     if n_missed:
         print(f"[train] WARNING: {n_missed} ground-truth pairs are not present in "
               f"candidate_pairs.tsv (blocking recall ceiling < 1.0). These cannot "
               f"be recovered by the matcher — revisit blocking if this is large.")
 
-    print(f"[train] {len(cand_pairs)} candidate pairs, "
-          f"{cand_pairs['label'].sum()} positive / {(cand_pairs['label']==0).sum()} negative")
+    print(f"[train] read {n_entities_seen} entities, {total_raw_candidates:,} raw candidate pairs "
+          f"-> kept {len(cand_pairs):,} after negative downsampling "
+          f"({int(cand_pairs['label'].sum())} positive / {int((cand_pairs['label']==0).sum())} negative)")
 
     print("[train] building features...")
     X, feat_names = build_feature_matrix_clean(cand_pairs, s1_lookup, s2s3_lookup)

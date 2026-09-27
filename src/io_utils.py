@@ -60,11 +60,32 @@ def build_clean_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
 
 def load_id_list_tsv(path: str, id_col: str, list_col: str) -> pd.DataFrame:
     """Loads a two-column TSV like ground_truth / candidate_pairs /
-    matching_results (source1_entity_id, <comma-separated ids>)."""
+    matching_results (source1_entity_id, <comma-separated ids>).
+
+    WARNING: reads the whole file into memory at once. Fine for
+    ground_truth.tsv (small — one row per Source-1 entity, short lists),
+    but candidate_pairs.tsv can be tens of GB at full dataset scale (see
+    blocking.py's own docstring). For that file, use
+    iter_id_list_tsv_chunks below instead."""
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
     if id_col not in df.columns or list_col not in df.columns:
         raise ValueError(f"{path} must have columns [{id_col}, {list_col}], got {list(df.columns)}")
     return df
+
+
+def iter_id_list_tsv_chunks(path: str, id_col: str, list_col: str, chunksize: int = 50_000):
+    """Streams a candidate_pairs.tsv-shaped file in chunks of `chunksize`
+    ROWS (each row = one Source-1 entity's full candidate list), instead
+    of loading the whole file into memory at once. This is what keeps
+    train_model.py / predict.py working on a multi-GB candidate file:
+    peak memory is bounded by chunksize, not by total file size, since
+    every Source-1 entity's row is self-contained (one row is never split
+    across chunk boundaries — chunking is row-wise)."""
+    reader = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, chunksize=chunksize)
+    for chunk in reader:
+        if id_col not in chunk.columns or list_col not in chunk.columns:
+            raise ValueError(f"{path} must have columns [{id_col}, {list_col}], got {list(chunk.columns)}")
+        yield chunk
 
 
 def explode_id_list(df: pd.DataFrame, id_col: str, list_col: str) -> pd.DataFrame:

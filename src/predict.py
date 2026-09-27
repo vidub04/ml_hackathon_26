@@ -34,8 +34,7 @@ from features import build_feature_matrix_clean  # noqa: E402
 from io_utils import (  # noqa: E402
     load_clean_source,
     build_clean_lookup,
-    load_id_list_tsv,
-    explode_id_list,
+    iter_id_list_tsv_chunks,
     write_id_list_tsv,
 )
 
@@ -76,6 +75,11 @@ def main():
     ap.add_argument("--max-matches-per-entity", type=int, default=None,
                      help="optional cap on matches kept per source1 entity "
                           "(highest score first) — leave unset for no cap")
+    ap.add_argument("--chunksize", type=int, default=50_000,
+                     help="rows (Source-1 entities) read from candidate_pairs.tsv per chunk. "
+                          "Lower this if you hit a MemoryError. Unlike training, nothing here "
+                          "is downsampled — every candidate is still scored, just not all at "
+                          "once in memory.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -89,38 +93,56 @@ def main():
     s2s3_lookup = {**build_clean_lookup(s2_df), **build_clean_lookup(s3_df)}
     valid_s2s3_ids = set(s2s3_lookup.keys())
 
-    cand_df = load_id_list_tsv(args.candidate_pairs, "source1_entity_id", "candidate_entity_ids")
-    cand_pairs = explode_id_list(cand_df, "source1_entity_id", "candidate_entity_ids")
-    cand_pairs = cand_pairs.drop_duplicates(subset=["source1_entity_id", "entity_id"]).reset_index(drop=True)
-
-    # safety: only keep candidates that actually exist in the test source files
-    before = len(cand_pairs)
-    cand_pairs = cand_pairs[cand_pairs["entity_id"].isin(valid_s2s3_ids)].reset_index(drop=True)
-    if len(cand_pairs) != before:
-        print(f"[predict] dropped {before - len(cand_pairs)} candidate ids not present in test source files")
-
-    print(f"[predict] {len(cand_pairs)} candidate pairs to score")
-
     predict_fn, saved_threshold = load_model(args.model)
     threshold = args.threshold if args.threshold is not None else saved_threshold
     print(f"[predict] using threshold={threshold:.3f}")
 
-    if len(cand_pairs):
-        X, _ = build_feature_matrix_clean(cand_pairs, s1_lookup, s2s3_lookup)
-        cand_pairs["score"] = predict_fn(X)
-    else:
-        cand_pairs["score"] = []
+    # ------------------------------------------------------------------
+    # Stream candidate_pairs.tsv in chunks (one row = one Source-1 entity's
+    # full candidate list — never split across chunk boundaries), scoring
+    # each chunk and keeping only entity_id -> matched ids, instead of
+    # holding a scored DataFrame for the entire file in memory at once.
+    # ------------------------------------------------------------------
+    print(f"[predict] streaming {args.candidate_pairs} in chunks of {args.chunksize} rows...")
+    matches_grouped = {}
+    total_candidates = 0
+    n_dropped_invalid = 0
 
-    matched = cand_pairs[cand_pairs["score"] >= threshold].copy()
-    matched = matched.sort_values("score", ascending=False)
-    if args.max_matches_per_entity:
-        matched = matched.groupby("source1_entity_id").head(args.max_matches_per_entity)
+    for chunk in iter_id_list_tsv_chunks(
+        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids", chunksize=args.chunksize
+    ):
+        s1_ids_out, cand_ids_out = [], []
+        for s1_id, id_list in zip(chunk["source1_entity_id"], chunk["candidate_entity_ids"]):
+            if not isinstance(id_list, str) or not id_list.strip():
+                continue
+            cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
+            cand_ids = list(dict.fromkeys(cand_ids))
+            for c in cand_ids:
+                if c in valid_s2s3_ids:
+                    s1_ids_out.append(s1_id)
+                    cand_ids_out.append(c)
+                else:
+                    n_dropped_invalid += 1
 
-    matches_grouped = (
-        matched.groupby("source1_entity_id")["entity_id"]
-        .apply(lambda ids: list(dict.fromkeys(ids)))
-        .to_dict()
-    )
+        if not s1_ids_out:
+            continue
+        chunk_pairs = pd.DataFrame({"source1_entity_id": s1_ids_out, "entity_id": cand_ids_out})
+        total_candidates += len(chunk_pairs)
+
+        X, _ = build_feature_matrix_clean(chunk_pairs, s1_lookup, s2s3_lookup)
+        chunk_pairs["score"] = predict_fn(X)
+
+        matched = chunk_pairs[chunk_pairs["score"] >= threshold]
+        if args.max_matches_per_entity:
+            matched = matched.sort_values("score", ascending=False)
+            matched = matched.groupby("source1_entity_id").head(args.max_matches_per_entity)
+
+        for s1_id, group in matched.groupby("source1_entity_id")["entity_id"]:
+            matches_grouped.setdefault(s1_id, []).extend(dict.fromkeys(group))
+
+    if n_dropped_invalid:
+        print(f"[predict] dropped {n_dropped_invalid} candidate ids not present in test source files")
+    print(f"[predict] scored {total_candidates} candidate pairs")
 
     # every source1 test entity must appear exactly once, even with no matches
     all_s1_ids = s1_df["entity_id"].tolist()
@@ -135,6 +157,7 @@ def main():
 
     # keep the exact candidate set used for inference alongside the results,
     # so matching_results.tsv is guaranteed to be a subset of candidate_pairs.tsv
+    # (a plain file copy — doesn't require loading the file into memory)
     dest_cand = out_dir / "candidate_pairs.tsv"
     src_cand = Path(args.candidate_pairs)
     if src_cand.resolve() != dest_cand.resolve():
