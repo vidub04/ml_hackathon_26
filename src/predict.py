@@ -34,7 +34,7 @@ from features import build_feature_matrix_clean  # noqa: E402
 from io_utils import (  # noqa: E402
     load_clean_source,
     build_clean_lookup,
-    iter_id_list_tsv_chunks,
+    iter_id_list_tsv_rows,
     write_id_list_tsv,
 )
 
@@ -75,11 +75,12 @@ def main():
     ap.add_argument("--max-matches-per-entity", type=int, default=None,
                      help="optional cap on matches kept per source1 entity "
                           "(highest score first) — leave unset for no cap")
-    ap.add_argument("--chunksize", type=int, default=50_000,
-                     help="rows (Source-1 entities) read from candidate_pairs.tsv per chunk. "
-                          "Lower this if you hit a MemoryError. Unlike training, nothing here "
-                          "is downsampled — every candidate is still scored, just not all at "
-                          "once in memory.")
+    ap.add_argument("--batch-size", type=int, default=50_000,
+                     help="candidate PAIRS batched together before each feature-build + "
+                          "score call (for speed — building features one row at a time is "
+                          "slow). Lower this if scoring itself uses too much memory. The "
+                          "underlying file read is always row-by-row (see io_utils), so this "
+                          "does NOT reintroduce the pandas-parser memory issue.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -98,47 +99,61 @@ def main():
     print(f"[predict] using threshold={threshold:.3f}")
 
     # ------------------------------------------------------------------
-    # Stream candidate_pairs.tsv in chunks (one row = one Source-1 entity's
-    # full candidate list — never split across chunk boundaries), scoring
-    # each chunk and keeping only entity_id -> matched ids, instead of
-    # holding a scored DataFrame for the entire file in memory at once.
+    # Stream candidate_pairs.tsv ONE ROW AT A TIME with Python's csv module
+    # (not pandas — see iter_id_list_tsv_rows's docstring). Rows are
+    # accumulated into a batch of ~batch_size pairs, scored together for
+    # speed, then discarded — only entity_id -> matched ids is kept
+    # long-term, never a scored DataFrame for the whole file at once.
     # ------------------------------------------------------------------
-    print(f"[predict] streaming {args.candidate_pairs} in chunks of {args.chunksize} rows...")
+    print(f"[predict] streaming {args.candidate_pairs} row by row "
+          f"(scoring in batches of {args.batch_size} pairs)...")
     matches_grouped = {}
     total_candidates = 0
     n_dropped_invalid = 0
+    n_entities_seen = 0
 
-    for chunk in iter_id_list_tsv_chunks(
-        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids", chunksize=args.chunksize
-    ):
-        s1_ids_out, cand_ids_out = [], []
-        for s1_id, id_list in zip(chunk["source1_entity_id"], chunk["candidate_entity_ids"]):
-            if not isinstance(id_list, str) or not id_list.strip():
-                continue
-            cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
-            cand_ids = list(dict.fromkeys(cand_ids))
-            for c in cand_ids:
-                if c in valid_s2s3_ids:
-                    s1_ids_out.append(s1_id)
-                    cand_ids_out.append(c)
-                else:
-                    n_dropped_invalid += 1
-
+    def _score_batch(s1_ids_out, cand_ids_out):
+        nonlocal total_candidates
         if not s1_ids_out:
-            continue
-        chunk_pairs = pd.DataFrame({"source1_entity_id": s1_ids_out, "entity_id": cand_ids_out})
-        total_candidates += len(chunk_pairs)
+            return
+        batch_pairs = pd.DataFrame({"source1_entity_id": s1_ids_out, "entity_id": cand_ids_out})
+        total_candidates += len(batch_pairs)
 
-        X, _ = build_feature_matrix_clean(chunk_pairs, s1_lookup, s2s3_lookup)
-        chunk_pairs["score"] = predict_fn(X)
+        X, _ = build_feature_matrix_clean(batch_pairs, s1_lookup, s2s3_lookup)
+        batch_pairs["score"] = predict_fn(X)
 
-        matched = chunk_pairs[chunk_pairs["score"] >= threshold]
+        matched = batch_pairs[batch_pairs["score"] >= threshold]
         if args.max_matches_per_entity:
             matched = matched.sort_values("score", ascending=False)
             matched = matched.groupby("source1_entity_id").head(args.max_matches_per_entity)
 
         for s1_id, group in matched.groupby("source1_entity_id")["entity_id"]:
             matches_grouped.setdefault(s1_id, []).extend(dict.fromkeys(group))
+
+    batch_s1, batch_cand = [], []
+    for s1_id, id_list in iter_id_list_tsv_rows(
+        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids"
+    ):
+        n_entities_seen += 1
+        if not id_list or not id_list.strip():
+            continue
+        cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
+        cand_ids = list(dict.fromkeys(cand_ids))
+        for c in cand_ids:
+            if c in valid_s2s3_ids:
+                batch_s1.append(s1_id)
+                batch_cand.append(c)
+            else:
+                n_dropped_invalid += 1
+
+        if len(batch_s1) >= args.batch_size:
+            _score_batch(batch_s1, batch_cand)
+            batch_s1, batch_cand = [], []
+
+        if n_entities_seen % 200_000 == 0:
+            print(f"[predict]   ...{n_entities_seen:,} entities read so far")
+
+    _score_batch(batch_s1, batch_cand)  # flush the last partial batch
 
     if n_dropped_invalid:
         print(f"[predict] dropped {n_dropped_invalid} candidate ids not present in test source files")

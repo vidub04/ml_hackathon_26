@@ -53,7 +53,7 @@ from io_utils import (  # noqa: E402
     load_clean_source,
     build_clean_lookup,
     load_id_list_tsv,
-    iter_id_list_tsv_chunks,
+    iter_id_list_tsv_rows,
     explode_id_list,
 )
 
@@ -225,9 +225,6 @@ def main():
     ap.add_argument("--model-out", default="models/matcher.pkl")
     ap.add_argument("--val-fraction", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--chunksize", type=int, default=50_000,
-                     help="rows (Source-1 entities) read from candidate_pairs.tsv per chunk. "
-                          "Lower this if you still hit a MemoryError.")
     ap.add_argument("--neg-per-pos", type=int, default=20,
                      help="for an entity with N true matches, keep at most neg_per_pos*max(N,1) "
                           "of its negative candidates (all positives are always kept). This is "
@@ -264,48 +261,51 @@ def main():
     pos_count_per_entity = gt_pairs.groupby("source1_entity_id").size().to_dict()
 
     # ------------------------------------------------------------------
-    # Stream candidate_pairs.tsv in chunks (one row = one Source-1 entity's
-    # full candidate list, so a row is never split across chunk boundaries).
-    # For each entity: keep ALL its positive candidates, and downsample its
+    # Stream candidate_pairs.tsv ONE ROW AT A TIME with Python's csv module
+    # (not pandas — see iter_id_list_tsv_rows's docstring for why). For
+    # each entity: keep ALL its positive candidates, and downsample its
     # negative candidates to a bounded number. This is what avoids ever
     # holding the full (potentially tens-of-GB) exploded candidate set in
-    # memory at once — peak memory is bounded by chunksize and by the
+    # memory at once — peak memory is bounded by one row plus the
     # downsampled pair count, not by the raw file size.
     # ------------------------------------------------------------------
-    print(f"[train] streaming {args.candidate_pairs} in chunks of {args.chunksize} rows...")
+    print(f"[train] streaming {args.candidate_pairs} row by row...")
     s1_ids_out, cand_ids_out, labels_out = [], [], []
     seen_positive_pairs = set()
     total_raw_candidates = 0
     n_entities_seen = 0
 
-    for chunk in iter_id_list_tsv_chunks(
-        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids", chunksize=args.chunksize
+    for s1_id, id_list in iter_id_list_tsv_rows(
+        args.candidate_pairs, "source1_entity_id", "candidate_entity_ids"
     ):
-        for s1_id, id_list in zip(chunk["source1_entity_id"], chunk["candidate_entity_ids"]):
-            n_entities_seen += 1
-            if not isinstance(id_list, str) or not id_list.strip():
-                continue
-            cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
-            cand_ids = list(dict.fromkeys(cand_ids))  # de-dup, keep order
-            total_raw_candidates += len(cand_ids)
+        n_entities_seen += 1
+        if not id_list or not id_list.strip():
+            continue
+        cand_ids = [c.strip() for c in id_list.split(",") if c.strip()]
+        cand_ids = list(dict.fromkeys(cand_ids))  # de-dup, keep order
+        total_raw_candidates += len(cand_ids)
 
-            pos_here = [c for c in cand_ids if (s1_id, c) in positive_set]
-            neg_here = [c for c in cand_ids if (s1_id, c) not in positive_set]
+        pos_here = [c for c in cand_ids if (s1_id, c) in positive_set]
+        neg_here = [c for c in cand_ids if (s1_id, c) not in positive_set]
 
-            seen_positive_pairs.update((s1_id, c) for c in pos_here)
+        seen_positive_pairs.update((s1_id, c) for c in pos_here)
 
-            n_pos_gt = pos_count_per_entity.get(s1_id, 0)
-            neg_budget = min(
-                args.max_neg_per_entity,
-                max(args.min_neg_per_entity, args.neg_per_pos * max(n_pos_gt, 1)),
-            )
-            if len(neg_here) > neg_budget:
-                neg_here = rng.sample(neg_here, neg_budget)
+        n_pos_gt = pos_count_per_entity.get(s1_id, 0)
+        neg_budget = min(
+            args.max_neg_per_entity,
+            max(args.min_neg_per_entity, args.neg_per_pos * max(n_pos_gt, 1)),
+        )
+        if len(neg_here) > neg_budget:
+            neg_here = rng.sample(neg_here, neg_budget)
 
-            for c in pos_here:
-                s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(1)
-            for c in neg_here:
-                s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(0)
+        for c in pos_here:
+            s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(1)
+        for c in neg_here:
+            s1_ids_out.append(s1_id); cand_ids_out.append(c); labels_out.append(0)
+
+        if n_entities_seen % 200_000 == 0:
+            print(f"[train]   ...{n_entities_seen:,} entities read so far "
+                  f"({len(s1_ids_out):,} pairs kept)")
 
     cand_pairs = pd.DataFrame({
         "source1_entity_id": s1_ids_out,
