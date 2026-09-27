@@ -1,8 +1,8 @@
 from preprocess import process_file
 
-process_file("student_resource/dataset/train/train_source1.tsv", "data/processed/train_source1_clean.tsv")
-process_file("student_resource/dataset/train/train_source2.tsv", "data/processed/train_source2_clean.tsv")
-process_file("student_resource/dataset/train/train_source3.tsv", "data/processed/train_source3_clean.tsv")
+process_file(r"student_resource/dataset/train/train_source1.tsv", r"data/processed/train_source1_clean.tsv")
+process_file(r"student_resource/dataset/train/train_source2.tsv", r"data/processed/train_source2_clean.tsv")
+process_file(r"student_resource/dataset/train/train_source3.tsv", r"data/processed/train_source3_clean.tsv")
 
 #%%
 from blocking import run_blocking
